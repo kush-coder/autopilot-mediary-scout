@@ -1,0 +1,784 @@
+import type { MergedSourceHealth } from "./resource-source-health.js";
+
+/**
+ * The implicit account that owns all data in a single-user (multi-user disabled)
+ * deployment, and the fail-closed default everywhere an account is not explicitly
+ * supplied. §7 multi-account scopes tracking data by account_id; single-user is
+ * simply "one account, auto-logged-in" — there is no separate code path.
+ */
+export const DEFAULT_ACCOUNT_ID = "acct_default";
+
+/** Hides rows the previous janitor wrote (`staging-janitor:<storageId>` inbox runs). */
+export function isStagingJanitorId(id: string): boolean {
+  return id.startsWith("staging-janitor");
+}
+
+export type MediaType = "movie" | "tv" | "anime";
+export type SeasonStatus = "active" | "completed";
+export type LatestAiredSource = "metadata" | "manual" | "unknown";
+export type AirStatus = "aired" | "unaired" | "unknown";
+export type MetadataStatus = "confirmed" | "provider_ahead" | "storage_only";
+/** `replace_request` = a user message asking the agent to swap a bad resource
+ *  (packages/workflow/src/replace-request.ts); it covers every tracked season. */
+/** `staging_recovery` = a silent janitor run that judges one leftover staging dir.
+ *  Users never see it (no notification, no activity row). */
+export type WorkflowKind =
+  | "type1_package_init"
+  | "type2_init"
+  | "type3_monitor"
+  | "movie_init"
+  | "replace_request"
+  | "staging_recovery";
+
+/** Runs of this kind stay off every user-facing list (activity, library, show page). */
+export function isUserVisibleWorkflowKind(kind: WorkflowKind): boolean {
+  return kind !== "staging_recovery";
+}
+
+/** Notice kinds a user must never see. Applied inside the notification queries,
+ *  before the limit, so a leftover row cannot crowd out a real one. */
+export const HIDDEN_NOTIFICATION_KINDS = ["staging_leftover", "staging_recovery"] as const;
+
+export function isUserVisibleNotificationKind(kind: string): boolean {
+  return !(HIDDEN_NOTIFICATION_KINDS as readonly string[]).includes(kind);
+}
+export type WorkflowStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "partial"
+  | "no_coverage"
+  /** A reserved (未上映) movie: tracked so the daily patrol can collect it when it
+   *  releases, but NOT queued/running — the worker never claims it and it is not an
+   *  "active" run (see isActiveWorkflowStatus). The air-time gate runs the agent. */
+  | "reserved";
+export type ResourceType = "115" | "magnet" | "manual" | "quark" | "uc" | "tianyi" | "123" | "guangya";
+export type TransferStatus = "succeeded" | "failed" | "no_target_change";
+export type Confidence = "low" | "medium" | "high";
+
+export interface MediaTitle {
+  id: string;
+  tmdbId: number;
+  type: MediaType;
+  title: string;
+  originalTitle: string;
+  year: number;
+  aliases: string[];
+  /** TMDB origin_country (e.g. ["JP"], ["CN"]) — drives the per-media-type search
+   *  recipe (searchProfile) for tv/anime, and lets the movie agent skip the 中文
+   *  subtitle floor for 国产片 (CN-origin). Set for tv/anime AND movies (movie
+   *  search itself stays origin-independent); absent only for demo titles. */
+  originCountries?: string[];
+  /** TMDB release date (YYYY-MM-DD) for a movie — the air-time gate for reserve:
+   *  an unreleased film (date in the future) is reserved, not acquired, until it
+   *  releases. Absent/null for TV and for movies TMDB has no date for. */
+  releaseDate?: string | null;
+  /** Scraped artwork/metadata — durable product state, read straight from the DB. */
+  posterPath?: string | null;
+  backdropPath?: string | null;
+  overview?: string;
+}
+
+export interface TrackedSeason {
+  id: string;
+  mediaTitleId: string;
+  seasonNumber: number;
+  status: SeasonStatus;
+  qualityPreference: string;
+  storageDirectoryId: string;
+  totalEpisodes: number;
+  latestAiredEpisode: number;
+  latestAiredSource: LatestAiredSource;
+}
+
+export interface EpisodeState {
+  trackedSeasonId: string;
+  episodeCode: string;
+  airDate: string | null;
+  title: string;
+  airStatus: AirStatus;
+  obtained: boolean;
+  metadataStatus: MetadataStatus;
+  verifiedFileIds: string[];
+}
+
+/** Live, cleaned agent progress written mid-run for the activity page's ticker +
+ *  rough bar. Absent until the run starts producing work; `percent` is clamped
+ *  monotonic on write. Not authoritative for anything — purely a display signal. */
+export interface WorkflowRunProgress {
+  /** Cleaned 中文 line of what the agent is doing now (no ids/paths). */
+  activity: string;
+  /** Coarse pipeline phase (AgentPhase): search/pick/transfer/verify/organize/mark/finalize. */
+  phase: string;
+  /** Rough 0–100 progress, phase-weighted + monotonic. */
+  percent: number;
+  updatedAt: string;
+  /** Real sub-fraction headline when known (episodes obtained / needed this run). */
+  obtained?: number;
+  needed?: number;
+}
+
+export interface WorkflowRun {
+  id: string;
+  kind: WorkflowKind;
+  status: WorkflowStatus;
+  trackedSeasonId: string;
+  startedAt: string;
+  finishedAt: string | null;
+  auditEvents: AuditEvent[];
+  progress?: WorkflowRunProgress;
+  /** Count of automatic retries already performed for a transient failure.
+   *  Absent/0 = never auto-requeued. Capped at AUTO_REQUEUE_MAX. */
+  autoRequeueCount?: number;
+  /** Earliest ISO time the worker may re-claim this run. Set when auto-requeued
+   *  (backoff); absent = immediately claimable. */
+  nextAttemptAt?: string;
+  /** How many times crash recovery has requeued this run from `running`→`queued`
+   *  on worker start. Absent/0 = never orphan-recovered. Capped at
+   *  ORPHAN_REQUEUE_MAX so a poison run cannot crash-loop the worker forever. */
+  orphanRequeueCount?: number;
+}
+
+export interface AuditEvent {
+  type: string;
+  message: string;
+  data?: Record<string, unknown>;
+}
+
+export interface ResourceCandidate {
+  id: string;
+  snapshotId: string;
+  index: number;
+  title: string;
+  type: ResourceType;
+  source: string;
+  providerPayload: Record<string, unknown>;
+}
+
+export interface ResourceSnapshot {
+  id: string;
+  provider: string;
+  keyword: string;
+  candidates: ResourceCandidate[];
+  createdAt: string;
+  /** 本次搜索各源的健康态。可选：老快照与不关心健康态的 provider 不带此字段。
+   *  缺失时按 healthy 处理（向后兼容），因此新增判定必须显式检查而非假设存在。 */
+  sourceHealth?: MergedSourceHealth;
+  /** Optional pre-agent filter trace (see SnapshotPrefilter). Absent when no filter ran. */
+  prefilter?: SnapshotPrefilter;
+}
+
+/** Result of an optional pre-agent candidate filter (today: Jev). Rides the jsonb
+ *  snapshot payload so dropped candidates stay auditable and future evals can be
+ *  replayed from production data. `skipped` = fail-open (nothing was dropped). */
+export interface SnapshotPrefilter {
+  provider: "jev";
+  model: string;
+  /** applied = filtered; skipped = not attempted (nothing judgeable); failed = attempted and errored → fail-open, nothing dropped. */
+  status: "applied" | "skipped" | "failed";
+  /** Why the filter was not applied: skipped (nothing judgeable) or failed (judge
+   *  error/timeout/circuit-open). Never contains secrets. */
+  reason?: string;
+  /** candidateId → P(refers to target) for every judged candidate, dropped ones included. */
+  scores: Record<string, number>;
+  dropped: Array<{ id: string; title: string; score: number }>;
+  /** Candidates the judge scored below dropBelow but that were KEPT because their title
+   *  contains the target title/alias verbatim (structural floor — the one unacceptable
+   *  failure is dropping the right pack). Only present when non-empty. */
+  floored?: Array<{ id: string; title: string; score: number }>;
+  thresholds: { dropBelow: number; uncertainBelow: number };
+  durationMs: number;
+  inputTokens?: number;
+  cost?: number;
+  /** Chunks the judge could not answer (their candidates were kept unjudged). Only
+   *  present when > 0; status stays "applied". */
+  failedChunks?: number;
+  /** candidateId → P(adult content) for every judged candidate. Only present when the
+   *  judge answered the nsfw question. */
+  nsfw?: Record<string, number>;
+  /** Candidates removed as adult content (see isNsfwDrop) — a separate bucket from
+   *  `dropped` (identity) so an audit can tell "wrong work" from "porn". `score` is the
+   *  nsfw probability. Wins over the containment floor. Only present when non-empty. */
+  nsfwDropped?: Array<{ id: string; title: string; score: number }>;
+}
+
+export interface AgentDecision {
+  node: string;
+  snapshotId: string;
+  selectedCandidateIds: string[];
+  episodeMapping: Record<string, string[]>;
+  providerAheadEpisodeMapping: Record<string, string[]>;
+  rejectedCandidateIds: string[];
+  confidence: Confidence;
+  reason: string;
+}
+
+/**
+ * One agent tool call, captured live (pre-execution) for post-mortem复盘. Appended
+ * incrementally so a run that crashes or aborts on a 115 budget throw still leaves its trace behind.
+ * `phase` mirrors AgentPhase in acquisition-v2/activity.ts (inlined here to avoid a
+ * domain→acquisition-v2 dependency).
+ */
+export interface AgentStep {
+  ordinal: number;
+  toolName: string;
+  args: Record<string, unknown>;
+  activity: string;
+  phase: "search" | "pick" | "transfer" | "verify" | "organize" | "mark" | "finalize";
+  /** Cumulative 115 API calls before this step ran (real 115 runs only; omitted otherwise). */
+  apiCalls?: number;
+  at: string;
+}
+
+export type CandidateDispositionKind = "selected" | "rejected" | "uncertain";
+
+export interface CandidateDisposition {
+  candidateId: string;
+  disposition: CandidateDispositionKind;
+  /** Episode codes this candidate covers; required non-empty for "selected". */
+  episodes: string[];
+  reason: string;
+}
+
+export interface AcquisitionPlan {
+  node: string;
+  /** Snapshot id observed in this planning run, or null when nothing covers the need. */
+  selectedSnapshotId: string | null;
+  searchedKeywords: string[];
+  candidateDispositions: CandidateDisposition[];
+  confidence: Confidence;
+  reason: string;
+}
+
+export interface AcquisitionFailureEvidence {
+  candidateId: string;
+  candidateTitle: string;
+  transferStatus: TransferStatus;
+  providerMessage: string;
+  episodesStillMissing: string[];
+}
+
+export interface TransferAttempt {
+  id: string;
+  workflowRunId: string;
+  candidateId: string;
+  status: TransferStatus;
+  providerMessage: string;
+  materializedFileIds: string[];
+  /**
+   * What became of the files this transfer materialized, counted at the end of
+   * its run: kept = moved into a target dir (or landed in the movie dir) and
+   * still there; thrownAway = deleted, discarded with staging, or left in
+   * staging. Absent = not recorded (older runs, or nothing materialized).
+   */
+  fate?: { kept: number; thrownAway: number };
+  /** The names those files actually landed under, parallel to materializedFileIds —
+   *  set only by an executor that knows them and whose landing name can differ from
+   *  the requested one (123 lands a taken name as `name(1).ext`). Absent = the
+   *  requested name. */
+  materializedNames?: string[];
+}
+
+export interface VerifiedFile {
+  id: string;
+  storageDirectoryId: string;
+  name: string;
+  sizeBytes: number;
+  /**
+   * The parsed episode code, or null for videos whose name exposes none (e.g.
+   * movies). A file is a video by virtue of its media EXTENSION; the episode
+   * code is optional metadata layered on top — TV coverage/dedup ignore nulls.
+   */
+  episodeCode: string | null;
+  providerFileId: string;
+}
+
+/** Where a notification's run was triggered from — drives feed grouping. */
+export type NotificationTrigger = "user" | "scheduled";
+
+/**
+ * Semantic state of an acquisition, surfaced to the user without the internal
+ * Type 1/2/3 taxonomy. Crucially, `partial` means an AIRED episode is still
+ * missing — unaired episodes never make a report look incomplete.
+ */
+export type NotificationReportStatus =
+  | "complete" // completed series/season, fully obtained — graduated, no longer tracking
+  | "acquired" // movie / one-off fully acquired
+  | "airing" // still airing; obtained up to the latest aired episode, future auto-tracked
+  | "partial" // a genuine aired gap remains
+  | "no_coverage" // nothing found yet
+  | "failed" // acquisition failed terminally (transient retries exhausted, or a hard error)
+  | "retrying" // transient failure; an automatic retry is scheduled
+  | "replaced"; // a user-requested replacement landed (the old file stays beside it)
+
+/**
+ * Structured acquisition report. The single source of wording: the web feed
+ * renders it as native UI (status pill + chips) and the push channels render it
+ * as emoji text — both are pure functions of this object.
+ */
+export interface NotificationReport {
+  titleName: string;
+  /** "第 1 季" for a single season; null for a whole-series rollup or a movie. */
+  seasonLabel: string | null;
+  status: NotificationReportStatus;
+  /** 1–2 concise summary lines, e.g. ["已获取至最新第 12 集 · 后续更新自动追踪"]. */
+  lines: string[];
+  /** Episodes obtained THIS run (the daily-sweep additions). */
+  newlyObtained: string[];
+  /** Aired-but-not-obtained genuine gaps. Never includes unaired episodes. */
+  realMissing: string[];
+  /** TMDB poster path (e.g. "/abc.jpg"); rendered as an image in rich pushes via
+   *  the TMDB CDN — no self-hosting. Null/absent → no poster. */
+  posterPath?: string | null;
+  /** For the tap-through link `{webBaseUrl}/show/{tmdbId}` (only when a public
+   *  base URL is configured). */
+  tmdbId?: number;
+  mediaType?: MediaType;
+  /** Movie release year, shown in the title as "标题 (年份)". */
+  year?: number;
+  /** Optional landing facts, shown when readily available. */
+  fileCount?: number;
+  totalBytes?: number;
+  landingDir?: string;
+  /** Short drive labels where files landed during this run (e.g. ["115"] or ["115", "123"]). */
+  driveLabels?: string[];
+}
+
+export interface NotificationEvent {
+  id: string;
+  workflowRunId: string;
+  kind: string;
+  title: string;
+  body: string;
+  createdAt: string;
+  /** Absent on legacy/foreign-work events; generators set it going forward. */
+  trigger?: NotificationTrigger;
+  report?: NotificationReport;
+  /** Connected storage ID of the workflow run that generated this notification (populated on read). */
+  connectedStorageId?: string | null;
+}
+
+export function episodeCode(seasonNumber: number, episodeNumber: number): string {
+  return `S${String(seasonNumber).padStart(2, "0")}E${String(episodeNumber).padStart(2, "0")}`;
+}
+
+export function episodeNumberFromCode(code: string): number {
+  const match = /^S\d{2}E(\d{2,})$/.exec(code);
+  if (!match) {
+    throw new Error(`Invalid episode code: ${code}`);
+  }
+  return Number(match[1]);
+}
+
+export function episodePartsFromCode(code: string): { seasonNumber: number; episodeNumber: number } {
+  const match = /^S(\d{2,})E(\d{2,})$/.exec(code);
+  if (!match) {
+    throw new Error(`Invalid episode code: ${code}`);
+  }
+  return {
+    seasonNumber: Number(match[1]),
+    episodeNumber: Number(match[2]),
+  };
+}
+
+/**
+ * A movie persists as a degenerate single-"episode" season anchor so it reuses
+ * the whole tracked-season machinery (repository, library wall, notifications)
+ * with no parallel type system. The user never sees the anchor — only "已入库".
+ * status is `completed` (no monitoring) and there is no real airing concept.
+ */
+/**
+ * The reserve air-time gate. A movie is "unreleased" (→ reserve, don't run the
+ * agent yet) only when it has a release date still in the FUTURE relative to now.
+ * Missing/empty/null date → released (we never gate on the unknown; the patrol's
+ * no_coverage retry already covers 已上映无源). Compared by calendar date
+ * (YYYY-MM-DD lexicographic), so the day it releases it counts as released.
+ */
+export function isMovieUnreleased(releaseDate: string | null | undefined, now: string): boolean {
+  if (!releaseDate) {
+    return false;
+  }
+  const release = releaseDate.slice(0, 10);
+  const today = now.slice(0, 10);
+  return release > today;
+}
+
+export function movieAnchorSeason(input: {
+  titleId: string;
+  qualityPreference: string;
+  storageDirectoryId: string;
+}): TrackedSeason {
+  return {
+    id: `${input.titleId}_movie`,
+    mediaTitleId: input.titleId,
+    seasonNumber: 1,
+    status: "completed",
+    qualityPreference: input.qualityPreference,
+    storageDirectoryId: input.storageDirectoryId,
+    totalEpisodes: 1,
+    latestAiredEpisode: 1,
+    latestAiredSource: "manual",
+  };
+}
+
+export function createEpisodeStates(input: {
+  trackedSeasonId: string;
+  seasonNumber: number;
+  totalEpisodes: number;
+  latestAiredEpisode: number;
+}): EpisodeState[] {
+  return Array.from({ length: input.totalEpisodes }, (_, index) => {
+    const episodeNumber = index + 1;
+    return {
+      trackedSeasonId: input.trackedSeasonId,
+      episodeCode: episodeCode(input.seasonNumber, episodeNumber),
+      airDate: null,
+      title: `Episode ${episodeNumber}`,
+      airStatus: episodeNumber <= input.latestAiredEpisode ? "aired" : "unaired",
+      obtained: false,
+      metadataStatus: "confirmed",
+      verifiedFileIds: [],
+    };
+  });
+}
+
+export function reconcileVerifiedFiles(input: {
+  season: TrackedSeason;
+  episodes: EpisodeState[];
+  files: VerifiedFile[];
+}): EpisodeState[] {
+  const byCode = new Map(input.episodes.map((episode) => [episode.episodeCode, { ...episode }]));
+
+  for (const file of input.files) {
+    if (file.storageDirectoryId !== input.season.storageDirectoryId) {
+      continue;
+    }
+    // Episode-less videos (movies, unparsed names) are real files but cannot map
+    // to a TV episode — coverage tracking ignores them.
+    if (file.episodeCode === null) {
+      continue;
+    }
+
+    const existing = byCode.get(file.episodeCode);
+    const episodeNumber = episodeNumberFromCode(file.episodeCode);
+    const metadataStatus: MetadataStatus =
+      existing?.metadataStatus ?? (episodeNumber > input.season.latestAiredEpisode ? "provider_ahead" : "storage_only");
+    const next: EpisodeState = existing ?? {
+      trackedSeasonId: input.season.id,
+      episodeCode: file.episodeCode,
+      airDate: null,
+      title: file.episodeCode,
+      airStatus: episodeNumber <= input.season.latestAiredEpisode ? "aired" : "unknown",
+      obtained: false,
+      metadataStatus,
+      verifiedFileIds: [],
+    };
+
+    byCode.set(file.episodeCode, {
+      ...next,
+      obtained: true,
+      metadataStatus: episodeNumber > input.season.latestAiredEpisode ? "provider_ahead" : next.metadataStatus,
+      verifiedFileIds: Array.from(new Set([...next.verifiedFileIds, file.id])),
+    });
+  }
+
+  return Array.from(byCode.values()).sort((a, b) => {
+    const aParts = episodePartsFromCode(a.episodeCode);
+    const bParts = episodePartsFromCode(b.episodeCode);
+    return aParts.seasonNumber - bParts.seasonNumber || aParts.episodeNumber - bParts.episodeNumber;
+  });
+}
+
+/**
+ * Per-season acquisition scope (which seasons, and how much of each, are in
+ * play for a series/title-level acquisition). Relocated from the retired
+ * pre-V2 `workflow.ts`; consumed by the V2 runner, queue commands, and worker.
+ */
+export interface AcquisitionSeasonScope {
+  seasonNumber: number;
+  totalEpisodes: number;
+  latestAiredEpisode: number;
+}
+
+/** A file in a (recursively listed) provider package tree: path + handle + size. */
+export interface PackageTreeFile {
+  path: string;
+  providerFileId: string;
+  sizeBytes: number;
+}
+
+/** Identity + lifecycle timestamps a runner threads through a persisted workflow run. */
+export interface WorkflowRunMetadata {
+  id: string;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+/**
+ * Facts produced by a movie acquisition run. Relocated from the retired
+ * pre-V2 `movie-workflow.ts`; the V2 movie path (`movie-workflow-v2.ts`,
+ * `runner-v2.ts`) emits exactly this shape so runner/web/UI are unchanged.
+ */
+export interface MovieWorkflowResult {
+  status: WorkflowStatus;
+  title: MediaTitle;
+  season: TrackedSeason;
+  episodes: EpisodeState[];
+  resourceSnapshots: ResourceSnapshot[];
+  transferAttempts: TransferAttempt[];
+  decisions: AgentDecision[];
+  notification: NotificationEvent;
+  notifications: NotificationEvent[];
+  auditEvents: AuditEvent[];
+}
+
+export interface DriveSpaceCacheEntry {
+  storageId: string;
+  totalBytes: number;
+  usedBytes: number;
+  probedAt: string;
+}
+
+/** One physical copy of an episode on a specific connected drive (`episode_copies`). */
+export interface EpisodeCopy {
+  trackedSeasonId: string;
+  episodeCode: string;
+  storageId: string;
+  fileIds: string[];
+  sizeBytes: number | null;
+  quality: string | null;
+  runId: string;
+  recordedAt: string;
+}
+
+/** Cross-drive union summary for one episode of a tracked season (C9). */
+export interface CrossDriveEpisodeOwnership {
+  episodeCode: string;
+  obtained: boolean;
+  metadataStatus: MetadataStatus;
+  drives: Array<{
+    storageId: string;
+    fileIds: string[];
+    sizeBytes: number | null;
+    quality: string | null;
+  }>;
+}
+
+/** 30-minute TTL for cached drive space numbers (`drive_space_cache`). */
+export const DRIVE_SPACE_CACHE_TTL_MS = 30 * 60 * 1000;
+
+/** Account-setting key storing the user's preferred drive order (JSON `string[]` of storageIds). */
+export const DRIVE_ORDER_SETTING_KEY = "drive_order";
+
+/** Order a list of drives by a user-configured `drive_order` array. Any drive not
+ *  named in `order` keeps its relative `createdAt` (connection-order) position after
+ *  the ordered ones. Pure & deterministic. */
+export function sortDrivesByOrder<T extends { id: string; createdAt?: string }>(
+  drives: readonly T[],
+  order: readonly string[] | null | undefined,
+): T[] {
+  const rank = new Map<string, number>();
+  order?.forEach((id, idx) => {
+    if (typeof id === "string" && id && !rank.has(id)) {
+      rank.set(id, idx);
+    }
+  });
+  return [...drives].sort((a, b) => {
+    const rA = rank.get(a.id);
+    const rB = rank.get(b.id);
+    if (rA !== undefined && rB !== undefined) return rA - rB;
+    if (rA !== undefined) return -1;
+    if (rB !== undefined) return 1;
+    if (a.createdAt && b.createdAt && a.createdAt !== b.createdAt) {
+      return a.createdAt.localeCompare(b.createdAt);
+    }
+    return 0;
+  });
+}
+
+/** Format drive space into a concise human-readable Chinese string for settings cards
+ *  and agent context. Negative remaining bytes (over-quota) are preserved explicitly,
+ *  never clamped to zero. */
+export function formatDriveSpaceSummary(
+  space: { totalBytes: number; usedBytes: number } | null | undefined,
+): {
+  remainingBytes: number | null;
+  overQuota: boolean;
+  badgeText: string;
+  agentText: string;
+} {
+  if (!space || !Number.isFinite(space.totalBytes) || !Number.isFinite(space.usedBytes) || space.totalBytes <= 0) {
+    return {
+      remainingBytes: null,
+      overQuota: false,
+      badgeText: "容量未知",
+      agentText: "容量未知",
+    };
+  }
+  const remainingBytes = space.totalBytes - space.usedBytes;
+  const overQuota = remainingBytes <= 0;
+  if (overQuota) {
+    const exceededLabel = formatByteSize(Math.abs(remainingBytes));
+    return {
+      remainingBytes,
+      overQuota: true,
+      badgeText: remainingBytes < 0
+        ? `已超额 ${exceededLabel}（共 ${formatByteSize(space.totalBytes)}）`
+        : `空间已满（共 ${formatByteSize(space.totalBytes)}）`,
+      agentText: remainingBytes < 0
+        ? `已超配额 ${exceededLabel}（总额 ${formatByteSize(space.totalBytes)}，已用 ${formatByteSize(space.usedBytes)}）— 禁止写入`
+        : `剩余 0 B（已满）— 禁止写入`,
+    };
+  }
+  return {
+    remainingBytes,
+    overQuota: false,
+    badgeText: `剩余 ${formatByteSize(remainingBytes)} / ${formatByteSize(space.totalBytes)}`,
+    agentText: `剩余 ${formatByteSize(remainingBytes)}（总额 ${formatByteSize(space.totalBytes)}）`,
+  };
+}
+
+/** Strict finite number coercion for JSON API responses: accepts only finite
+ *  numbers or non-empty numeric strings (rejects null, booleans, "", whitespace). */
+export function parseFiniteMetric(value: unknown): number {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : Number.NaN;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  }
+  return Number.NaN;
+}
+
+export function formatByteSize(bytes: number): string {
+  const abs = Math.abs(bytes);
+  const sign = bytes < 0 ? "-" : "";
+  const TB = 1024 ** 4;
+  const GB = 1024 ** 3;
+  const MB = 1024 ** 2;
+  if (abs >= TB) {
+    return `${sign}${(abs / TB).toFixed(2)} TB`;
+  }
+  if (abs >= GB) {
+    return `${sign}${(abs / GB).toFixed(1)} GB`;
+  }
+  if (abs >= MB) {
+    return `${sign}${(abs / MB).toFixed(1)} MB`;
+  }
+  return `${sign}${Math.round(abs)} B`;
+}
+
+/** Compare episode codes numerically by (season, episode) when possible,
+ *  falling back to lexicographic comparison for non-standard codes. */
+export function compareEpisodeCodes(a: string, b: string): number {
+  const mA = /^S(\d+)E(\d+)$/.exec(a);
+  const mB = /^S(\d+)E(\d+)$/.exec(b);
+  if (mA && mB) {
+    const sDiff = Number(mA[1]) - Number(mB[1]);
+    if (sDiff !== 0) return sDiff;
+    return Number(mA[2]) - Number(mB[2]);
+  }
+  return a.localeCompare(b);
+}
+
+/** Build the cross-drive union of episode ownership from per-drive episode_states
+ *  buckets and `episode_copies` rows.
+ *  - `episode_states` is authoritative for drives that have a tracked bucket for
+ *    this season under the account: an episode is obtained on that drive iff
+ *    `ep.obtained === true`.
+ *  - `episode_copies` provides `fileIds`, `sizeBytes`, and `quality` for those
+ *    obtained episodes, and also contributes obtained episodes on drives owned by
+ *    the account that do not have a separate `episode_states` bucket (unless the
+ *    season was untracked across all buckets). */
+export function buildCrossDriveEpisodeOwnership(input: {
+  driveEpisodeBuckets: ReadonlyArray<{
+    storageId: string;
+    episodes: readonly EpisodeState[];
+  }>;
+  copies: readonly EpisodeCopy[];
+  ownedStorageIds?: ReadonlySet<string>;
+  unscopedStorageSentinel?: string;
+}): CrossDriveEpisodeOwnership[] {
+  const unscoped = input.unscopedStorageSentinel ?? "";
+  const copyByEpisodeAndDrive = new Map<string, EpisodeCopy>();
+  for (const c of input.copies) {
+    copyByEpisodeAndDrive.set(`${c.episodeCode}::${c.storageId}`, c);
+  }
+
+  const byEpisode = new Map<string, CrossDriveEpisodeOwnership>();
+  const bucketsSeen = new Set<string>();
+
+  for (const bucket of input.driveEpisodeBuckets) {
+    bucketsSeen.add(bucket.storageId);
+    for (const ep of bucket.episodes) {
+      let entry = byEpisode.get(ep.episodeCode);
+      if (!entry) {
+        entry = {
+          episodeCode: ep.episodeCode,
+          obtained: false,
+          metadataStatus: ep.metadataStatus,
+          drives: [],
+        };
+        byEpisode.set(ep.episodeCode, entry);
+      }
+      if (ep.obtained) {
+        entry.obtained = true;
+        if (ep.metadataStatus === "provider_ahead") {
+          entry.metadataStatus = "provider_ahead";
+        }
+        if (bucket.storageId && bucket.storageId !== unscoped) {
+          const copy = copyByEpisodeAndDrive.get(`${ep.episodeCode}::${bucket.storageId}`);
+          if (!entry.drives.some((d) => d.storageId === bucket.storageId)) {
+            entry.drives.push({
+              storageId: bucket.storageId,
+              fileIds: copy && copy.fileIds.length > 0 ? [...copy.fileIds] : [...ep.verifiedFileIds],
+              sizeBytes: copy?.sizeBytes ?? null,
+              quality: copy?.quality ?? null,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Only fold in episode_copies from drives that do NOT have an authoritative
+  // episode_states bucket (or when no bucket listed that drive) AND belong to
+  // the account, provided the season has at least one tracked bucket for the account.
+  if (input.driveEpisodeBuckets.length > 0) {
+    for (const c of input.copies) {
+      if (input.ownedStorageIds && !input.ownedStorageIds.has(c.storageId)) {
+        continue;
+      }
+      if (bucketsSeen.has(c.storageId)) {
+        // Authoritative bucket already processed above: if ep.obtained was false
+        // in that drive's episode_states, do NOT resurrect it from episode_copies.
+        continue;
+      }
+      let entry = byEpisode.get(c.episodeCode);
+      if (!entry) {
+        entry = {
+          episodeCode: c.episodeCode,
+          obtained: true,
+          metadataStatus: "confirmed",
+          drives: [],
+        };
+        byEpisode.set(c.episodeCode, entry);
+      } else {
+        entry.obtained = true;
+      }
+      if (!entry.drives.some((d) => d.storageId === c.storageId)) {
+        entry.drives.push({
+          storageId: c.storageId,
+          fileIds: [...c.fileIds],
+          sizeBytes: c.sizeBytes,
+          quality: c.quality,
+        });
+      }
+    }
+  }
+
+  return [...byEpisode.values()].sort((a, b) => compareEpisodeCodes(a.episodeCode, b.episodeCode));
+}
+

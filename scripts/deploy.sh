@@ -1,0 +1,102 @@
+#!/bin/sh
+# Reliable, SELF-VERIFYING self-host redeploy: pull latest, rebuild web, restart the
+# stack, then PROVE the running container actually serves the pulled commit.
+#
+# Why this exists (2026-07-04 #88–#98): five deploys in a row silently kept serving OLD
+# code — the box ran a stale image for a whole day before anyone noticed. The failure
+# was invisible because the usual signals lie: host `git rev-parse HEAD` shows the new
+# commit even when the container runs an old image, and watching the image hash is noisy
+# (a fresh `--no-cache` build changes the hash purely from build non-determinism). So the
+# real fix isn't a cache trick — it's a check: this script compares the RUNNING
+# container's stamped commit (BUILD_COMMIT) against HEAD and exits non-zero on mismatch,
+# which catches a stale build, a no-op `git pull`, or a container that wasn't recreated.
+#
+# It also does NOT use `--no-cache` (that throws away the cached `npm ci`, ~minutes):
+# GIT_SHA=$(git rev-parse HEAD) is passed as a build arg the Dockerfile uses right before
+# `COPY . .`, forcing a fresh source COPY + build per commit while deps stay cached.
+#
+# Usage (on the host, in the repo dir):   ./scripts/deploy.sh [extra `up` args]
+set -eu
+
+# Repo root = the script's parent dir. Plain dirname (no `--`, no `cd --`) for
+# portability across /bin/sh implementations (busybox ash, dash, bash).
+cd "$(dirname "$0")/.."
+
+# Take the same repository lock the updater's run-update.sh takes, so a one-click update and
+# this manual deploy never build/checkout/swap the same repo and compose project at once. The
+# lock is a git/docker-ignored file at the repo root; the updater sees the same inode through
+# its bind mount, and flock is an inode-level advisory lock the kernel shares across the two.
+# The updater only holds it during a normal update, not during its own recovery, so a deploy
+# meant to fix a broken state is never blocked. Held via fd 9 for this whole script.
+# flock is on Linux hosts (util-linux) and the updater's Alpine image; absent on macOS, where
+# `command -v flock` skips it (the deployment box is Linux). Non-blocking: refuse, don't hang.
+if command -v flock >/dev/null 2>&1; then
+  LOCK=".update.lock"
+  [ -e "$LOCK" ] || (umask 000; : > "$LOCK") 2>/dev/null || true
+  exec 9>>"$LOCK"
+  if ! flock -n 9; then
+    echo "==> 一键更新正在进行，请等它结束后再运行本脚本（或在设置→更新里查看进度）。"
+    exit 1
+  fi
+fi
+
+# The updater leaves the deploy folder on a release tag; pull needs a branch.
+git symbolic-ref -q HEAD >/dev/null || git checkout main
+
+echo "==> git pull --ff-only"
+git pull --ff-only
+
+GIT_SHA="$(git rev-parse HEAD)"
+export GIT_SHA
+echo "==> Building web at commit ${GIT_SHA}"
+# compose reads build.args GIT_SHA=${GIT_SHA} from the exported env above — no need to
+# pass --build-arg. No --no-cache either: the GIT_SHA cache-bust already forces the
+# source COPY + build to re-run, while keeping the (slow) npm ci layer cached.
+# Build the updater too: `docker compose up -d` never rebuilds an existing image, and
+# one-click updates only replace web (the updater can't swap its own container) — a
+# manual deploy is the only way the updater itself gets new code.
+docker compose build web updater
+
+echo "==> Starting stack"
+docker compose up -d "$@"
+
+# Verify: the running container reports the commit we just built. This is the check
+# that host `git rev-parse HEAD` CANNOT give you (a stale image outlives a pulled HEAD).
+echo "==> Verifying running container commit"
+# Retry rather than a fixed sleep: `up -d` returns before the container is
+# exec-able, and slow hosts need longer — a flat `sleep 2` gives false negatives.
+RUNNING=""
+i=0
+while [ "$i" -lt 15 ]; do
+  RUNNING="$(docker compose exec -T web cat BUILD_COMMIT 2>/dev/null || true)"
+  [ -n "$RUNNING" ] && break
+  i=$((i + 1))
+  sleep 1
+done
+[ -n "$RUNNING" ] || RUNNING='<no BUILD_COMMIT — image predates this fix; rebuild once more>'
+echo "    expected (HEAD):        ${GIT_SHA}"
+echo "    running container:      ${RUNNING}"
+if [ "${RUNNING}" = "${GIT_SHA}" ]; then
+  echo "==> Verifying application readiness"
+  i=0
+  READY=0
+  while [ "$i" -lt 60 ]; do
+    if docker compose exec -T web node -e "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+      READY=1
+      break
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  if [ "$READY" = "1" ]; then
+    echo "==> OK: container serves the freshly built commit and passes the DB-backed health probe."
+  else
+    echo "==> WARNING: container commit matches HEAD but /api/health never became ready."
+    docker compose logs --tail=100 web || true
+    exit 1
+  fi
+else
+  echo "==> WARNING: running container commit != HEAD. The build may have been cached"
+  echo "    stale, or the container did not recreate. Investigate before trusting it."
+  exit 1
+fi

@@ -1,0 +1,69 @@
+.env
+.env.local
+.env.*.local
+.pan115_cookie
+
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.sisyphus/
+.serena/
+
+.venv/
+venv/
+
+*.db
+*.sqlite
+*.sqlite3
+
+node_modules/
+dist/
+.next/
+apps/**/.next/
+coverage/
+
+# macOS
+.DS_Store
+.media-track-credentials-backup.json
+
+# personal dev tooling (keep launch.json as contributor example)
+AGENTS.md
+.claude/settings.json
+.claude/using-superpowers-*
+
+# internal working docs — kept on disk for the maintainer's workflow, never published
+docs/PROJECT-STATUS.md
+docs/superpowers/
+docs/incident-*.md
+docs/audit-*.md
+docs/e2e-live-*.md
+docs/original-skill-permission-audit-*.md
+docs/roadmap-self-host-expansion.md
+.vercel
+.env*
+
+# 个人博客草稿(推广用,不进公共仓库)
+docs/blog/
+
+# OhMyOpenCode runtime session artifacts
+.omo/
+apps/desktop/dist-app/
+.playwright-cli/
+.superpowers/
+.wrangler/
+.worktrees/
+
+# 本地推广草稿与素材（docs/promo/README.md 自述不入公共 repo）
+docs/promo/
+docs/images/devto-cover.*
+.opencode/
+.opencode/ralph-loop.local.md
+
+# 根目录截图残留（agent 浏览器会话产物，不该入库）
+/*.png
+
+# Database dumps from ./scripts/pg-backup.sh and the updater (backups/pre-update-*.sql.gz).
+/backups/
+
+# The updater/deploy shared lock file (scripts/deploy.sh + updater/run-update.sh).
+/.update.lock

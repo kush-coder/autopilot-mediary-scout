@@ -1,0 +1,10 @@
+{
+  "name": "@media-track/web",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@media-track/workflow": "*",
+    "@vercel/analytics": "^2.0.1",
+    "undici": "^7.28.0"
+  }
+}

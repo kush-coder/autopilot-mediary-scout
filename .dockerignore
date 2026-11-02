@@ -1,0 +1,18 @@
+node_modules
+**/node_modules
+.next
+**/.next
+**/dist
+.git
+.github
+.env
+.env.*
+!.env.example
+*.sqlite
+.media-track-*
+.DS_Store
+docs
+*.log
+# Database dumps from ./scripts/pg-backup.sh and the updater. Never ship them into an image.
+backups
+.update.lock

@@ -1,0 +1,50 @@
+/**
+ * OpenHands-style loop guard. The blunt step-count cap is the wrong primitive for
+ * "the agent went crazy" — it kills legitimately-long tasks (a 6-season show) yet
+ * misses a tight death-loop inside the cap. The real signal is REPETITION WITHOUT
+ * PROGRESS: the same tool call returning the same result, or two steps ping-ponging.
+ *
+ * Cheap + deterministic (string compares, no LLM), meant to run every step. The
+ * caller normalizes each AI-SDK step into a {tool, args, result} signature first.
+ */
+export interface ToolStepSignature {
+  tool: string;
+  /** Stable stringification of the tool input (ids/timestamps excluded by caller). */
+  args: string;
+  /** Stable stringification of the observation (ids/timestamps excluded). */
+  result: string;
+}
+
+const IDENTICAL_RUN_THRESHOLD = 4; // 4 identical action-observation pairs in a row
+const PINGPONG_WINDOW = 6; // 6 trailing steps alternating between exactly 2 sigs
+
+function key(s: ToolStepSignature): string {
+  return `${s.tool}\u0000${s.args}\u0000${s.result}`;
+}
+
+export function shouldStopForRepetition(steps: ToolStepSignature[]): boolean {
+  const n = steps.length;
+
+  // (1) N identical pairs at the tail.
+  if (n >= IDENTICAL_RUN_THRESHOLD) {
+    const tail = steps.slice(n - IDENTICAL_RUN_THRESHOLD).map(key);
+    if (tail.every((k) => k === tail[0])) {
+      return true;
+    }
+  }
+
+  // (2) A/B ping-pong: the last PINGPONG_WINDOW steps use exactly 2 distinct
+  // signatures and strictly alternate. Distinct, alternating work is not progress.
+  if (n >= PINGPONG_WINDOW) {
+    const window = steps.slice(n - PINGPONG_WINDOW).map(key);
+    const distinct = new Set(window);
+    if (distinct.size === 2) {
+      const alternating = window.every((k, i) => k === window[i % 2]);
+      if (alternating) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
